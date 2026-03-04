@@ -652,17 +652,24 @@ class SpotifyProvider(MusicProvider):
 
         initial_album_count = 5
         seen_track_ids: set[str] = set()
+        seen_tracks: set[tuple[str, str, int]] = set()  # (name, version, duration_rounded)
         result: list[Track] = []
 
         for album in albums[:initial_album_count]:
             album_tracks = await self.get_album_tracks(album.item_id)
             for track in album_tracks:
-                if track.item_id not in seen_track_ids:
-                    seen_track_ids.add(track.item_id)
-                    track.album = album
-                    if album.metadata.images:
-                        track.metadata.images = album.metadata.images
-                    result.append(track)
+                if track.item_id in seen_track_ids:
+                    continue
+                # Deduplicate by name, version, and duration (within 2s tolerance)
+                track_key = (track.name.lower(), track.version.lower(), round(track.duration / 2))
+                if track_key in seen_tracks:
+                    continue
+                seen_track_ids.add(track.item_id)
+                seen_tracks.add(track_key)
+                track.album = album
+                if album.metadata.images:
+                    track.metadata.images = album.metadata.images
+                result.append(track)
 
         remaining_albums = albums[initial_album_count:]
         if remaining_albums:
@@ -679,6 +686,7 @@ class SpotifyProvider(MusicProvider):
                     remaining_albums,
                     result.copy(),
                     seen_track_ids.copy(),
+                    seen_tracks.copy(),
                 )
             )
         else:
@@ -698,6 +706,7 @@ class SpotifyProvider(MusicProvider):
         remaining_albums: list[Album],
         result: list[Track],
         seen_track_ids: set[str],
+        seen_tracks: set[tuple[str, str, int]],
     ) -> None:
         """Fetch remaining album tracks in background and update cache when complete."""
         self.logger.debug(
@@ -710,12 +719,22 @@ class SpotifyProvider(MusicProvider):
             try:
                 album_tracks = await self.get_album_tracks(album.item_id)
                 for track in album_tracks:
-                    if track.item_id not in seen_track_ids:
-                        seen_track_ids.add(track.item_id)
-                        track.album = album
-                        if album.metadata.images:
-                            track.metadata.images = album.metadata.images
-                        result.append(track)
+                    if track.item_id in seen_track_ids:
+                        continue
+                    # Deduplicate by name, version, and duration (within 2s tolerance)
+                    track_key = (
+                        track.name.lower(),
+                        track.version.lower(),
+                        round(track.duration / 2),
+                    )
+                    if track_key in seen_tracks:
+                        continue
+                    seen_track_ids.add(track.item_id)
+                    seen_tracks.add(track_key)
+                    track.album = album
+                    if album.metadata.images:
+                        track.metadata.images = album.metadata.images
+                    result.append(track)
             except Exception as err:
                 self.logger.warning("Error fetching tracks for album %s: %s", album.item_id, err)
 
