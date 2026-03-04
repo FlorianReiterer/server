@@ -242,7 +242,7 @@ class SpotifyProvider(MusicProvider):
 
         search_query = search_query.replace("'", "")
         offset = 0
-        page_limit = min(limit, 50)
+        page_limit = min(limit, 10)
 
         while True:
             api_result = await self._get_data(
@@ -575,7 +575,7 @@ class SpotifyProvider(MusicProvider):
             # The resume position will be automatically updated by MA's internal tracking
             # and will be retrieved via get_audiobook() which combines MA + Spotify positions
 
-    @use_cache()
+    @use_cache(86400 * 365)  # 1 year - album track listings are immutable
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """Get all album tracks for given album id."""
         return [
@@ -584,11 +584,11 @@ class SpotifyProvider(MusicProvider):
             if item["id"]
         ]
 
-    @use_cache(2600 * 3)  # 3 hours
+    @use_cache(3600 * 3)  # 3 hours
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
         is_liked_songs = prov_playlist_id == self._get_liked_songs_playlist_id()
-        uri = "me/tracks" if is_liked_songs else f"playlists/{prov_playlist_id}/tracks"
+        uri = "me/tracks" if is_liked_songs else f"playlists/{prov_playlist_id}/items"
 
         # Liked songs always require global session
         # For other playlists, call get_playlist first to trigger the fallback logic
@@ -616,9 +616,9 @@ class SpotifyProvider(MusicProvider):
             # so we need to break when we've reached the total.
             if (offset + index) > total:
                 break
-            if not (item and item["track"] and item["track"]["id"]):
+            if not (item and item["item"] and item["item"]["id"]):
                 continue
-            track = parse_track(item["track"], self)
+            track = parse_track(item["item"], self)
             track.position = offset + index
             result.append(track)
         return result
@@ -634,55 +634,144 @@ class SpotifyProvider(MusicProvider):
             if (item and item["id"])
         ]
 
-    @use_cache(86400 * 14)  # 14 days
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
-        """Get a list of 10 most popular tracks for the given artist."""
-        artist = await self.get_artist(prov_artist_id)
-        endpoint = f"artists/{prov_artist_id}/top-tracks"
-        items = await self._get_data(endpoint)
-        return [
-            parse_track(item, self, artist=artist)
-            for item in items["tracks"]
-            if (item and item["id"])
-        ]
+        """Get all tracks for an artist by collecting tracks from all their albums.
+
+        For large discographies, returns initial results quickly and fetches
+        remaining albums in the background. Complete results are cached for 14 days;
+        partial results are cached for 20 minutes while background fetch completes.
+        """
+        cache_key = f"artist_toptracks.{prov_artist_id}"
+
+        if cached := await self.mass.cache.get(cache_key, provider=self.instance_id):
+            return [Track.from_dict(t) for t in cached]
+
+        albums = await self.get_artist_albums(prov_artist_id)
+        if not albums:
+            return []
+
+        initial_album_count = 5
+        seen_track_ids: set[str] = set()
+        result: list[Track] = []
+
+        for album in albums[:initial_album_count]:
+            album_tracks = await self.get_album_tracks(album.item_id)
+            for track in album_tracks:
+                if track.item_id not in seen_track_ids:
+                    seen_track_ids.add(track.item_id)
+                    track.album = album
+                    if album.metadata.images:
+                        track.metadata.images = album.metadata.images
+                    result.append(track)
+
+        remaining_albums = albums[initial_album_count:]
+        if remaining_albums:
+            await self.mass.cache.set(
+                cache_key,
+                [t.to_dict() for t in result],
+                provider=self.instance_id,
+                expiration=1200,
+            )
+            self.mass.create_task(
+                self._fetch_remaining_artist_tracks(
+                    prov_artist_id,
+                    cache_key,
+                    remaining_albums,
+                    result.copy(),
+                    seen_track_ids.copy(),
+                )
+            )
+        else:
+            await self.mass.cache.set(
+                cache_key,
+                [t.to_dict() for t in result],
+                provider=self.instance_id,
+                expiration=86400 * 14,
+            )
+
+        return result
+
+    async def _fetch_remaining_artist_tracks(
+        self,
+        prov_artist_id: str,
+        cache_key: str,
+        remaining_albums: list[Album],
+        result: list[Track],
+        seen_track_ids: set[str],
+    ) -> None:
+        """Fetch remaining album tracks in background and update cache when complete."""
+        self.logger.debug(
+            "Fetching remaining %d albums for artist %s in background",
+            len(remaining_albums),
+            prov_artist_id,
+        )
+
+        for album in remaining_albums:
+            try:
+                album_tracks = await self.get_album_tracks(album.item_id)
+                for track in album_tracks:
+                    if track.item_id not in seen_track_ids:
+                        seen_track_ids.add(track.item_id)
+                        track.album = album
+                        if album.metadata.images:
+                            track.metadata.images = album.metadata.images
+                        result.append(track)
+            except Exception as err:
+                self.logger.warning("Error fetching tracks for album %s: %s", album.item_id, err)
+
+        await self.mass.cache.set(
+            cache_key,
+            [t.to_dict() for t in result],
+            provider=self.instance_id,
+            expiration=86400 * 14,
+        )
+        self.logger.debug(
+            "Completed fetching all tracks for artist %s (%d tracks total)",
+            prov_artist_id,
+            len(result),
+        )
 
     async def library_add(self, item: MediaItemType) -> bool:
         """Add item to library."""
-        if item.media_type == MediaType.ARTIST:
-            await self._put_data("me/following", {"ids": [item.item_id]}, type="artist")
-        elif item.media_type == MediaType.ALBUM:
-            await self._put_data("me/albums", {"ids": [item.item_id]})
-        elif item.media_type == MediaType.TRACK:
-            await self._put_data("me/tracks", {"ids": [item.item_id]})
-        elif item.media_type == MediaType.PLAYLIST:
-            await self._put_data(f"playlists/{item.item_id}/followers", data={"public": False})
-        elif item.media_type == MediaType.PODCAST:
-            await self._put_data("me/shows", ids=item.item_id)
-        elif item.media_type == MediaType.AUDIOBOOK and self.audiobooks_supported:
-            await self._put_data("me/audiobooks", ids=item.item_id)
+        uri_type_map = {
+            MediaType.ARTIST: "artist",
+            MediaType.ALBUM: "album",
+            MediaType.TRACK: "track",
+            MediaType.PLAYLIST: "playlist",
+            MediaType.PODCAST: "show",
+            MediaType.AUDIOBOOK: "audiobook",
+        }
+        if item.media_type == MediaType.AUDIOBOOK and not self.audiobooks_supported:
+            return False
+        uri_type = uri_type_map.get(item.media_type)
+        if uri_type:
+            uri = f"spotify:{uri_type}:{item.item_id}"
+            await self._put_data("me/library", uris=uri)
         return True
 
     async def library_remove(self, prov_item_id: str, media_type: MediaType) -> bool:
         """Remove item from library."""
-        if media_type == MediaType.ARTIST:
-            await self._delete_data("me/following", {"ids": [prov_item_id]}, type="artist")
-        elif media_type == MediaType.ALBUM:
-            await self._delete_data("me/albums", {"ids": [prov_item_id]})
-        elif media_type == MediaType.TRACK:
-            await self._delete_data("me/tracks", {"ids": [prov_item_id]})
-        elif media_type == MediaType.PLAYLIST:
-            await self._delete_data(f"playlists/{prov_item_id}/followers")
-        elif media_type == MediaType.PODCAST:
-            await self._delete_data("me/shows", ids=prov_item_id)
-        elif media_type == MediaType.AUDIOBOOK and self.audiobooks_supported:
-            await self._delete_data("me/audiobooks", ids=prov_item_id)
+        uri_type_map = {
+            MediaType.ARTIST: "artist",
+            MediaType.ALBUM: "album",
+            MediaType.TRACK: "track",
+            MediaType.PLAYLIST: "playlist",
+            MediaType.PODCAST: "show",
+            MediaType.AUDIOBOOK: "audiobook",
+        }
+        if media_type == MediaType.AUDIOBOOK and not self.audiobooks_supported:
+            return False
+        uri_type = uri_type_map.get(media_type)
+        if uri_type:
+            uri = f"spotify:{uri_type}:{prov_item_id}"
+            await self._delete_data("me/library", uris=uri)
         return True
 
     async def add_playlist_tracks(self, prov_playlist_id: str, prov_track_ids: list[str]) -> None:
         """Add track(s) to playlist."""
         track_uris = [f"spotify:track:{track_id}" for track_id in prov_track_ids]
         data = {"uris": track_uris}
-        await self._post_data(f"playlists/{prov_playlist_id}/tracks", data=data)
+        await self._post_data(f"playlists/{prov_playlist_id}/items", data=data)
 
     async def remove_playlist_tracks(
         self, prov_playlist_id: str, positions_to_remove: tuple[int, ...]
@@ -690,21 +779,19 @@ class SpotifyProvider(MusicProvider):
         """Remove track(s) from playlist."""
         track_uris = []
         for pos in positions_to_remove:
-            uri = f"playlists/{prov_playlist_id}/tracks"
+            uri = f"playlists/{prov_playlist_id}/items"
             spotify_result = await self._get_data(uri, limit=1, offset=pos - 1)
             for item in spotify_result["items"]:
-                if not (item and item["track"] and item["track"]["id"]):
+                if not (item and item["item"] and item["item"]["id"]):
                     continue
-                track_uris.append({"uri": f"spotify:track:{item['track']['id']}"})
-        data = {"tracks": track_uris}
-        await self._delete_data(f"playlists/{prov_playlist_id}/tracks", data=data)
+                track_uris.append({"uri": f"spotify:track:{item['item']['id']}"})
+        data = {"items": track_uris}
+        await self._delete_data(f"playlists/{prov_playlist_id}/items", data=data)
 
     async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """Create a new playlist on provider with given name."""
-        if self._sp_user is None:
-            raise LoginFailed("User info not available - not logged in")
         data = {"name": name, "public": False}
-        new_playlist = await self._post_data(f"users/{self._sp_user['id']}/playlists", data=data)
+        new_playlist = await self._post_data("me/playlists", data=data)
         self._fix_create_playlist_api_bug(new_playlist)
         return parse_playlist(new_playlist, self)
 
