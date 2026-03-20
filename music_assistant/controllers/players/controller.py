@@ -75,7 +75,6 @@ from music_assistant.constants import (
     CONF_ENTRY_ANNOUNCE_VOLUME_MIN,
     CONF_ENTRY_ANNOUNCE_VOLUME_STRATEGY,
     CONF_ENTRY_TTS_PRE_ANNOUNCE,
-    CONF_ENTRY_ZEROCONF_INTERFACES,
     CONF_PLAYER_DSP,
     CONF_PLAYERS,
     CONF_PRE_ANNOUNCE_CHIME_URL,
@@ -153,7 +152,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         values: dict[str, ConfigValueType] | None = None,
     ) -> tuple[ConfigEntry, ...]:
         """Return Config Entries for the Player Controller."""
-        return (CONF_ENTRY_ZEROCONF_INTERFACES,)
+        return ()
 
     async def setup(self, config: CoreConfig) -> None:
         """Async initialize of module."""
@@ -803,7 +802,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             return
 
         # handle to protocol player as volume_mute control
-        if protocol_player := self.get_player(player.state.volume_control):
+        if protocol_player := self.get_player(player.mute_control):
             self.logger.debug(
                 "Redirecting mute command to protocol player %s",
                 protocol_player.provider.manifest.name,
@@ -1329,10 +1328,14 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             # We use the 'initialized' attribute to indicate that the player
             # is still in the process of being registered so we can filter it out where needed.
             self._players[player_id] = player
+            # update state to ensure player.state reflects the final attributes
+            # (e.g. player type) set after super().__init__() in the player subclass,
+            # before we fetch config (which relies on state.type for entry resolution)
+            player.update_state(signal_event=False)
             # ensure we fetch and set the latest/full config for the player
             player_config = await self.mass.config.get_player_config(player_id)
             player.set_config(player_config)
-            # update state without signaling event first (ensures all attributes are set)
+            # update state again now that config is loaded
             player.update_state(signal_event=False)
             # call hook after the player is registered and config is set
             await player.on_config_updated()
@@ -1359,7 +1362,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
 
         # Schedule debounced update of all players since can_group_with values may change
         # when a new player is added (provider IDs expand to include the new player)
-        self._schedule_update_all_players(5)
+        self._schedule_update_all_players(2)
 
     async def register_or_update(self, player: Player) -> None:
         """Register a new player on the controller or update existing one."""
@@ -1499,19 +1502,34 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             # nothing changed
             return
 
-        # always signal update to the playerqueue
-        if player.state.type != PlayerType.PROTOCOL:
-            self.mass.player_queues.on_player_update(player, changed_values)
-
         # to prevent spamming the eventbus on small changes (e.g. elapsed time),
-        # we check if there are only changes in the elapsed time
-        clean_changed_keys = set(changed_values.keys()) - {"current_media.elapsed_time"}
+        # we check if there are only changes in the elapsed time and send
+        # a lightweight event.
+        clean_changed_keys = set(changed_values.keys()) - {
+            "current_media.elapsed_time",
+            "elapsed_time_last_updated",
+        }
         if clean_changed_keys == {ATTR_ELAPSED_TIME} and not force_update:
-            # ignore small changes in elapsed time
-            prev_value = changed_values[ATTR_ELAPSED_TIME][0] or 0
-            new_value = changed_values[ATTR_ELAPSED_TIME][1] or 0
-            if abs(prev_value - new_value) < 5:
-                return
+            now = time.time()
+            prev_elapsed, new_elapsed = changed_values[ATTR_ELAPSED_TIME]
+            prev_updated, new_updated = changed_values.get("elapsed_time_last_updated", (now, now))
+            prev_corrected = (prev_elapsed or 0) + (now - (prev_updated or now))
+            new_corrected = (new_elapsed or 0) + (now - (new_updated or now))
+            if abs(prev_corrected - new_corrected) > 1.0:
+                self.mass.player_queues.on_player_elapsed_time_corrected(player)
+                if player.protocol_parent_id:
+                    self.trigger_player_update(player.protocol_parent_id)
+            return
+
+        # signal update to the playerqueue
+        if player.state.type != PlayerType.PROTOCOL:
+            self.mass.call_later(
+                0.5,
+                self.mass.player_queues.on_player_update,
+                player,
+                changed_values,
+                task_id=f"queue_on_player_update_{player.player_id}",
+            )
 
         # handle DSP reload of the leader when grouping/ungrouping
         if ATTR_GROUP_MEMBERS in changed_values:
@@ -2159,11 +2177,13 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 # if the player is playing, update elapsed time every tick
                 # to ensure the queue has accurate details
                 player_playing = player.state.playback_state == PlaybackState.PLAYING
-                if player_playing:
-                    self.mass.loop.call_soon(
+                if player_playing and player.type != PlayerType.PROTOCOL:
+                    self.mass.call_later(
+                        0.5,
                         self.mass.player_queues.on_player_update,
                         player,
-                        {"corrected_elapsed_time": (None, player.corrected_elapsed_time)},
+                        {"corrected_elapsed_time": (None, player.state.corrected_elapsed_time)},
+                        task_id=f"queue_on_player_update_{player.player_id}",
                     )
                 # Poll player;
                 if not player.needs_poll:
@@ -3007,7 +3027,12 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         # If there are still protocol group members, keep the protocol active so that
         # when playback resumes it continues on the same protocol.
         if target_player.player_id == player.player_id or len(target_player.group_members) <= 1:
-            player.set_active_output_protocol(None)
+            self.mass.call_later(
+                5,
+                player.set_active_output_protocol,
+                None,
+                task_id=f"clear_active_protocol_{player_id}",
+            )
 
     async def _handle_cmd_play(self, player_id: str) -> None:
         """
