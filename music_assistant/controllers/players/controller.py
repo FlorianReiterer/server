@@ -105,7 +105,7 @@ from .helpers import AnnounceData, handle_player_command, wait_for_power_on
 from .protocol_linking import ProtocolLinkingMixin
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Coroutine, Iterator
 
     from music_assistant_models.config_entries import (
         ConfigEntry,
@@ -113,6 +113,7 @@ if TYPE_CHECKING:
         CoreConfig,
         PlayerConfig,
     )
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.player_queue import PlayerQueue
 
     from music_assistant import MusicAssistant
@@ -1022,9 +1023,21 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             source = player_id  # default to MA queue source
         player = self.get_player(player_id, True)
         assert player is not None  # for type checking
-        # Check if player is currently grouped (reject for public API)
-        if player.state.synced_to or player.state.active_group:
-            raise PlayerCommandFailed(f"Player {player.state.name} is currently grouped")
+        # If player is currently grouped, handle it so the source switch can proceed.
+        # This allows external sources (e.g. Spotify Connect, AirPlay) to take over a grouped player.
+        if player.state.active_group and (
+            group_player := self.get_player(player.state.active_group)
+        ):
+            if player_id in group_player.state.static_group_members:
+                # player is a static member of a permanent group - stop the group
+                # and power it off if supported, rather than removing the member
+                await self._handle_cmd_stop(group_player.player_id)
+                if group_player.state.power_control != PLAYER_CONTROL_NONE:
+                    await self._handle_cmd_power(group_player.player_id, False)
+            else:
+                await self.cmd_ungroup(player_id)
+        elif player.state.synced_to:
+            await self.cmd_ungroup(player_id)
         # Delegate to internal handler for actual implementation
         await self._handle_select_source(player_id, source)
 
@@ -1863,6 +1876,48 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 elapsed_time,
             )
 
+    async def wait_for_player_update(
+        self,
+        player_id: str,
+        timeout: float = 5.0,
+        action: Coroutine[Any, Any, Any] | None = None,
+    ) -> bool:
+        """
+        Wait for a state update event on the given player.
+
+        Subscribes to PLAYER_UPDATED events *before* executing the optional action,
+        so that state updates emitted synchronously during the action are not missed.
+
+        :param player_id: The player ID to wait for.
+        :param timeout: Maximum time to wait in seconds.
+        :param action: Optional coroutine to execute while subscribed.
+        :return: True if a state update was received, False if timed out.
+        """
+        update_event = asyncio.Event()
+
+        def _on_event(_event: MassEvent) -> None:
+            update_event.set()
+
+        unsub = self.mass.subscribe(
+            _on_event,
+            event_filter=EventType.PLAYER_UPDATED,
+            id_filter=player_id,
+        )
+        try:
+            if action is not None:
+                await action
+            async with asyncio.timeout(timeout):
+                await update_event.wait()
+                return True
+        except TimeoutError:
+            self.logger.debug(
+                "Timed out waiting for state update on player %s, proceeding optimistically",
+                player_id,
+            )
+            return False
+        finally:
+            unsub()
+
     async def on_player_config_change(self, config: PlayerConfig, changed_keys: set[str]) -> None:
         """Call (by config manager) when the configuration of a player changes."""
         player = self.get_player(config.player_id)
@@ -2506,8 +2561,13 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             player.state.synced_to,
             log_context,
         )
-        await self.cmd_set_members(player.state.synced_to, player_ids_to_remove=[player.player_id])
-        await asyncio.sleep(2)
+        await self.wait_for_player_update(
+            player.player_id,
+            timeout=5,
+            action=self.cmd_set_members(
+                player.state.synced_to, player_ids_to_remove=[player.player_id]
+            ),
+        )
 
     async def _handle_set_members(
         self,
@@ -2587,9 +2647,16 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         final_player_ids_to_remove: list[str] = []
         if player_ids_to_remove:
             for child_player_id in player_ids_to_remove:
-                if child_player_id not in parent_player.state.group_members:
+                if child_player_id in parent_player.state.group_members:
+                    final_player_ids_to_remove.append(child_player_id)
                     continue
-                final_player_ids_to_remove.append(child_player_id)
+                # also accept the removal if the child player itself reports
+                # being synced to this parent - handles race conditions where the
+                # parent's group_members state is stale/not yet updated
+                child_player = self.get_player(child_player_id)
+                if child_player and child_player.state.synced_to == target_player:
+                    final_player_ids_to_remove.append(child_player_id)
+                    continue
 
         # Forward command to the appropriate player after all (base) sanity checks
         # GROUP players (sync_group, universal_group) manage their own members internally
@@ -2793,9 +2860,10 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             and not player_was_sync_child
             and player_state.playback_state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
         ):
-            await self._handle_cmd_stop(player_id)
-            # short sleep: allow the stop command to process and prevent race conditions
-            await asyncio.sleep(0.2)
+            # wait for the stop command to process and prevent race conditions
+            await self.wait_for_player_update(
+                player_id, timeout=5, action=self._handle_cmd_stop(player_id)
+            )
 
         # power off all synced childs when player is a sync leader
         elif not powered and player_state.type == PlayerType.PLAYER and player_state.group_members:
@@ -3055,8 +3123,9 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if prev_source and source != prev_source:
             with suppress(PlayerCommandFailed, RuntimeError):
                 # just try to stop (regardless of state)
-                await self._handle_cmd_stop(player_id)
-                await asyncio.sleep(2)  # small delay to allow stop to process
+                await self.wait_for_player_update(
+                    player_id, timeout=5, action=self._handle_cmd_stop(player_id)
+                )
         # check if source is a pluginsource
         # in that case the source id is the instance_id of the plugin provider
         if plugin_prov := self.mass.get_provider(source):
