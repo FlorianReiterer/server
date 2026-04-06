@@ -636,7 +636,8 @@ class MetaDataController(CoreController):
     async def _get_release_group_artwork(
         self, mb_release_group: MusicBrainzReleaseGroup
     ) -> tuple[MediaItemMetadata, str] | None:
-        """Try to get thumb artwork for a release group from metadata providers.
+        """
+        Try to get thumb artwork for a release group from metadata providers.
 
         :param mb_release_group: MusicBrainz release group to look up.
         :returns: Tuple of (metadata, provider_name) or None if not found.
@@ -674,7 +675,8 @@ class MetaDataController(CoreController):
         artist_name: str,
         track_name: str,
     ) -> tuple[Any, bool]:
-        """Search MusicBrainz with fallback variants (swapped, without 'The').
+        """
+        Search MusicBrainz with fallback variants (swapped, without 'The').
 
         :param musicbrainz: MusicBrainz provider instance.
         :param artist_name: Artist name to search for.
@@ -723,7 +725,8 @@ class MetaDataController(CoreController):
         artist_name: str,
         track_name: str,
     ) -> tuple[MediaItemMetadata | None, str | None, str | None, str | None]:
-        """Search for track/artist metadata by name.
+        """
+        Search for track/artist metadata by name.
 
         Checks library first for immediate results, then falls back to
         MusicBrainz for external metadata lookups.
@@ -841,7 +844,8 @@ class MetaDataController(CoreController):
         return None, None, None, None
 
     def _get_thumb_image(self, metadata: MediaItemMetadata) -> MediaItemMetadata | None:
-        """Extract only THUMB type image from metadata.
+        """
+        Extract only THUMB type image from metadata.
 
         Returns new metadata with only the thumb image, or None if no thumb found.
         Used for radio artwork where we specifically need artist/album thumbnails,
@@ -859,7 +863,8 @@ class MetaDataController(CoreController):
     async def _get_library_track_metadata(
         self, artist_name: str, track_name: str
     ) -> MediaItemMetadata | None:
-        """Search library for matching track and return its metadata.
+        """
+        Search library for matching track and return its metadata.
 
         :param artist_name: Artist name to match.
         :param track_name: Track title to match.
@@ -890,7 +895,8 @@ class MetaDataController(CoreController):
         return None
 
     async def _get_library_artist_metadata(self, artist_name: str) -> MediaItemMetadata | None:
-        """Search library for matching artist and return its metadata.
+        """
+        Search library for matching artist and return its metadata.
 
         :param artist_name: Artist name to match.
         """
@@ -919,7 +925,8 @@ class MetaDataController(CoreController):
         return None
 
     def _match_artist_name(self, search_name: str, artists: list[Artist | ItemMapping]) -> bool:
-        """Check if any artist matches the search name.
+        """
+        Check if any artist matches the search name.
 
         :param search_name: Artist name to search for.
         :param artists: List of artists to check against.
@@ -936,7 +943,8 @@ class MetaDataController(CoreController):
         return False
 
     async def _get_library_item_thumb(self, track: Track) -> str | None:
-        """Get image URL for library track with fallback: track -> album -> artist.
+        """
+        Get image URL for library track with fallback: track -> album -> artist.
 
         :param track: Track to get image for.
         """
@@ -982,7 +990,8 @@ class MetaDataController(CoreController):
         return None
 
     def get_radio_stream_station_image(self, streamdetails: StreamDetails) -> str | None:
-        """Get station image URL from queue current item.
+        """
+        Get station image URL from queue current item.
 
         :param streamdetails: StreamDetails for the radio stream.
         """
@@ -996,7 +1005,8 @@ class MetaDataController(CoreController):
 
     @staticmethod
     def normalize_radio_artist_name(artist_name: str) -> str:
-        """Normalize artist name from radio stream metadata.
+        """
+        Normalize artist name from radio stream metadata.
 
         Handles common formats like "Squier, Billy" -> "Billy Squier" while
         avoiding mangling of names like "Lipps, Inc." or "Portugal. The Man".
@@ -1057,7 +1067,8 @@ class MetaDataController(CoreController):
         track_name: str,
         fallback_image_url: str | None = None,
     ) -> tuple[str | None, str | None, str | None]:
-        """Look up artwork by artist and track name.
+        """
+        Look up artwork by artist and track name.
 
         Searches library and external providers for matching artwork.
         Also returns corrected artist/track names if the search detects
@@ -1146,7 +1157,8 @@ class MetaDataController(CoreController):
         return image_url or fallback_image_url, corrected_artist, corrected_track
 
     async def update_radio_stream_artwork(self, streamdetails: StreamDetails) -> None:
-        """Fetch and update radio stream artwork.
+        """
+        Fetch and update radio stream artwork.
 
         :param streamdetails: StreamDetails to update with artwork.
         """
