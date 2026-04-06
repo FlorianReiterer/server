@@ -10,13 +10,15 @@ This module tests the core grouping behavior including:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from music_assistant_models.enums import PlaybackState, PlayerFeature
+from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
 
 from music_assistant.controllers.players import PlayerController
-from tests.common import MockPlayer, MockProvider
+from music_assistant.providers.sync_group.player import SyncGroupPlayer
+from tests.common import MockPlayer, MockProvider, create_mock_config
 
 
 @pytest.fixture
@@ -212,6 +214,55 @@ class TestSyncLeaderBehavior:
 
         # Leader should NOT appear in other's can_group_with (has group members)
         assert "leader" not in other.state.can_group_with
+
+    @pytest.mark.asyncio
+    async def test_dynamic_leader_switch_removes_protocol_leader_directly(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """Dynamic leader switching must bypass controller dissolve-self handling."""
+        controller = PlayerController(mock_mass)
+        mock_mass.players = controller
+
+        native_provider = MockProvider("test_provider", instance_id="test", mass=mock_mass)
+        protocol_provider = MockProvider("airplay", instance_id="airplay", mass=mock_mass)
+        group_provider = MockProvider("sync_group", instance_id="sync_group", mass=mock_mass)
+        object.__setattr__(native_provider, "players", [])
+        object.__setattr__(protocol_provider, "players", [])
+        object.__setattr__(group_provider, "players", [])
+
+        leader = MockPlayer(native_provider, "leader", "Leader")
+        member = MockPlayer(native_provider, "member", "Member")
+        protocol_player = MockPlayer(
+            protocol_provider,
+            "leader_airplay",
+            "Leader AirPlay",
+            player_type=PlayerType.PROTOCOL,
+        )
+        leader.set_active_output_protocol(protocol_player.player_id)
+
+        mock_mass.config.get_base_player_config.return_value = create_mock_config("Sync Group")
+        sync_group = SyncGroupPlayer(cast("Any", group_provider), "group")
+        sync_group._attr_group_members = ["leader", "member"]
+        sync_group.sync_leader = leader
+        object.__setattr__(group_provider, "players", [sync_group])
+
+        controller._players = {
+            "group": sync_group,
+            "leader": leader,
+            "member": member,
+            "leader_airplay": protocol_player,
+        }
+
+        with (
+            patch.object(controller, "cmd_set_members", AsyncMock()) as cmd_set_members,
+            patch.object(protocol_player, "set_members", AsyncMock()) as protocol_set_members,
+        ):
+            await sync_group._dynamic_leader_switch("leader")
+
+        protocol_set_members.assert_awaited_once_with(player_ids_to_remove=["leader_airplay"])
+        cmd_set_members.assert_not_awaited()
+        assert sync_group.sync_leader is member
+        assert sync_group.group_members[0] == "member"
 
 
 class TestCircularDependency:

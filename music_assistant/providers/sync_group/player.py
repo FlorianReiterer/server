@@ -602,13 +602,21 @@ class SyncGroupPlayer(Player):
             self.display_name,
         )
 
-        # Remove the old leader at the protocol level
-        # This flows to e.g. AirPlayPlayer.set_members which calls
-        # stream_session.remove_client() - only removing that one client
-        await self.mass.players.cmd_set_members(
-            old_leader.player_id,
-            player_ids_to_remove=[old_leader_id],
-        )
+        # Remove the old leader on the concrete grouped player directly.
+        # Going through PlayerController.cmd_set_members with a "remove self"
+        # request triggers the controller's dissolve-group shortcut, which
+        # would tear down the whole sync session instead of handing off leader.
+        group_target = old_leader
+        remove_member_id = old_leader_id
+        if (
+            old_leader.active_output_protocol
+            and old_leader.active_output_protocol != "native"
+            and (protocol_player := self.mass.players.get_player(old_leader.active_output_protocol))
+        ):
+            group_target = protocol_player
+            remove_member_id = protocol_player.player_id
+
+        await group_target.set_members(player_ids_to_remove=[remove_member_id])
 
         # Remove the old leader from our group members
         if old_leader_id in self._attr_group_members:
